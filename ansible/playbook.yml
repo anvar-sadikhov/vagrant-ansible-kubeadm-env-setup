@@ -1,0 +1,269 @@
+---
+# kubeadm cluster bring-up + Cilium CNI. IP-agnostic — reads ansible_host
+# from inventory.ini, so it works unchanged against either provider.
+
+- name: Common setup for all nodes
+  hosts: all
+  become: true
+  vars:
+    kubernetes_version: "1.31"
+  tasks:
+    - name: Disable swap
+      ansible.builtin.command: swapoff -a
+      changed_when: true
+
+    - name: Remove swap entry from /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+
+    - name: Load kernel modules needed by containerd/Kubernetes
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Persist kernel modules across reboots
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: "0644"
+
+    - name: Set sysctl params required by Kubernetes networking
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_set: true
+        state: present
+        reload: true
+      loop:
+        - { name: net.bridge.bridge-nf-call-iptables, value: "1" }
+        - { name: net.bridge.bridge-nf-call-ip6tables, value: "1" }
+        - { name: net.ipv4.ip_forward, value: "1" }
+
+    - name: Install containerd and dependencies
+      ansible.builtin.apt:
+        name:
+          - containerd
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - conntrack
+          - socat
+          - ebtables
+        state: present
+        update_cache: true
+
+    - name: Ensure /etc/containerd exists
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        mode: "0755"
+
+    - name: Generate default containerd config
+      ansible.builtin.shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Enable SystemdCgroup in containerd config
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+      notify: Restart containerd
+
+    - name: Ensure containerd is running and enabled
+      ansible.builtin.systemd:
+        name: containerd
+        state: started
+        enabled: true
+
+    - name: Create keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download Kubernetes apt signing key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key"
+        dest: /tmp/kubernetes-release.key
+        mode: "0644"
+
+    - name: Dearmor Kubernetes apt signing key
+      ansible.builtin.shell: >
+        gpg --batch --yes --dearmor
+        -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/kubernetes-release.key
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: >
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg]
+          https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /
+        mode: "0644"
+
+    - name: Install kubelet, kubeadm, kubectl
+      ansible.builtin.apt:
+        name:
+          - "kubelet"
+          - "kubeadm"
+          - "kubectl"
+        state: present
+        update_cache: true
+
+    - name: Hold Kubernetes packages at their installed version
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Pin kubelet's advertised node IP to the LAN address
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        content: "KUBELET_EXTRA_ARGS=--node-ip={{ ansible_host }}\n"
+        mode: "0644"
+      notify: Restart kubelet
+
+    - name: Ensure kubelet is enabled
+      ansible.builtin.systemd:
+        name: kubelet
+        enabled: true
+        daemon_reload: true
+
+  handlers:
+    - name: Restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+
+- name: Initialize the control plane
+  hosts: master
+  become: true
+  vars:
+    pod_network_cidr: "10.244.0.0/16"
+    cilium_cli_version: "v0.16.19"
+  tasks:
+    - name: Run kubeadm init
+      ansible.builtin.command: >
+        kubeadm init
+        --apiserver-advertise-address={{ ansible_host }}
+        --pod-network-cidr={{ pod_network_cidr }}
+        --node-name={{ inventory_hostname }}
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Create .kube directory for the ssh user
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+
+    - name: Copy admin.conf to the ssh user's kubeconfig
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: true
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0600"
+
+    - name: Also set kubeconfig for root (used by ansible become)
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: "0700"
+
+    - name: Copy admin.conf for root
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: true
+        mode: "0600"
+
+    - name: Detect architecture for Cilium CLI download
+      ansible.builtin.set_fact:
+        cilium_cli_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+
+    - name: Download Cilium CLI
+      ansible.builtin.unarchive:
+        src: "https://github.com/cilium/cilium-cli/releases/download/{{ cilium_cli_version }}/cilium-linux-{{ cilium_cli_arch }}.tar.gz"
+        dest: /usr/local/bin
+        remote_src: true
+        creates: /usr/local/bin/cilium
+
+    - name: Check whether Cilium is already installed
+      ansible.builtin.command: cilium status
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: cilium_status_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install Cilium CNI into the cluster
+      ansible.builtin.command: >
+        cilium install
+        --set ipam.operator.clusterPoolIPv4PodCIDRList={{ pod_network_cidr }}
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: cilium_status_check.rc != 0
+
+    - name: Wait for Cilium to report ready
+      ansible.builtin.command: cilium status --wait
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: false
+
+    - name: Generate the kubeadm join command
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: kubeadm_join_command
+      changed_when: false
+
+    - name: Share the join command with worker nodes
+      ansible.builtin.set_fact:
+        join_command: "{{ kubeadm_join_command.stdout }}"
+      delegate_to: "{{ item }}"
+      delegate_facts: true
+      loop: "{{ groups['workers'] }}"
+
+- name: Join worker nodes to the cluster
+  hosts: workers
+  become: true
+  tasks:
+    - name: Run kubeadm join
+      ansible.builtin.command: "{{ hostvars[inventory_hostname].join_command }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+
+- name: Show cluster status
+  hosts: master
+  become: true
+  tasks:
+    - name: kubectl get nodes -o wide
+      ansible.builtin.command: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: nodes_output
+      changed_when: false
+
+    - name: Print cluster status
+      ansible.builtin.debug:
+        msg: "{{ nodes_output.stdout_lines }}"

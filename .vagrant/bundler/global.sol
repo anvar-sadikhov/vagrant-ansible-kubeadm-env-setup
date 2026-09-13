@@ -1,0 +1,1 @@
+{"dependencies":[["iniparse",["~> 1.4",">= 1.4.2"]],["vagrant-multipass",["= 0.1.2"]]],"checksum":"2cd85a9363abc3e8087e3da02ff7590db34cdf085a2f41bbdbf1dca4d1b26908","vagrant_version":"2.4.9"}
