@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python3 -c \"import yaml; print\\('pyyaml ok'\\)\")",
+      "Bash(python3 -)",
+      "Bash(git rm *)",
+      "Read(//mnt/c/HashiCorp/Vagrant/embedded/mingw64/bin/**)",
+      "Bash(cmd.exe /c \"where vagrant & where VBoxManage & echo %VBOX_MSI_INSTALL_PATH%\")",
+      "Read(//mnt/c/Program Files/Vagrant/**)"
+    ]
+  }
+}

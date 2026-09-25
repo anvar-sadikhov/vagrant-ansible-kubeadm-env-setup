@@ -1,12 +1,18 @@
 ---
-# kubeadm cluster bring-up + Cilium CNI. IP-agnostic — reads ansible_host
-# from inventory.ini, so it works unchanged against either provider.
+# kubeadm cluster bring-up + Cilium CNI. Runs inside the controlplane VM
+# (Vagrant's ansible_local provisioner) against the inventory the Vagrantfile
+# generates, so it works unchanged against either provider.
+#
+# k8s_node_ip is the address each node advertises to Kubernetes: the
+# inventory's node_ip when set (VirtualBox — its default route is the NAT
+# adapter, 10.0.2.15 on every node), else the default IPv4 (Multipass).
 
 - name: Common setup for all nodes
   hosts: all
   become: true
   vars:
-    kubernetes_version: "1.31"
+    kubernetes_version: "1.37"
+    k8s_node_ip: "{{ node_ip | default(ansible_default_ipv4.address) }}"
   tasks:
     - name: Disable swap
       ansible.builtin.command: swapoff -a
@@ -129,10 +135,10 @@
         - kubeadm
         - kubectl
 
-    - name: Pin kubelet's advertised node IP to the LAN address
+    - name: Pin kubelet's advertised node IP
       ansible.builtin.copy:
         dest: /etc/default/kubelet
-        content: "KUBELET_EXTRA_ARGS=--node-ip={{ ansible_host }}\n"
+        content: "KUBELET_EXTRA_ARGS=--node-ip={{ k8s_node_ip }}\n"
         mode: "0644"
       notify: Restart kubelet
 
@@ -158,12 +164,13 @@
   become: true
   vars:
     pod_network_cidr: "10.244.0.0/16"
-    cilium_cli_version: "v0.16.19"
+    k8s_node_ip: "{{ node_ip | default(ansible_default_ipv4.address) }}"
+    cilium_cli_version: "v0.20.1"
   tasks:
     - name: Run kubeadm init
       ansible.builtin.command: >
         kubeadm init
-        --apiserver-advertise-address={{ ansible_host }}
+        --apiserver-advertise-address={{ k8s_node_ip }}
         --pod-network-cidr={{ pod_network_cidr }}
         --node-name={{ inventory_hostname }}
       args:
@@ -185,6 +192,15 @@
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
         mode: "0600"
+
+    - name: Add `k` alias and bash completion for kubectl
+      ansible.builtin.blockinfile:
+        path: "/home/{{ ansible_user }}/.bashrc"
+        marker: "# {mark} ANSIBLE MANAGED: kubectl alias"
+        block: |
+          source <(kubectl completion bash)
+          alias k=kubectl
+          complete -o default -F __start_kubectl k
 
     - name: Also set kubeconfig for root (used by ansible become)
       ansible.builtin.file:
